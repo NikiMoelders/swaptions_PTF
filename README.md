@@ -1,0 +1,1 @@
+This repository contains the swaption portfolio constructions and pricing models developed for my undergraduate BSc Mathematics thesis "Hedging Mortgage Prepayment Risk" at University College Dublin

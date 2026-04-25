@@ -6,35 +6,24 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-import matplotlib.pyplot as plt 
-import itertools
-import os 
 
 # ============================================================
-# 1) Mortgage Amortisation + Prepayment
+# 1) Amortisation
 # ============================================================
 
-
-def simulate_amortization_cpr(payment_freq, maturity_years, N_0, K_rate, cpr, start_date, apply_cpr=True):
-    """
-    Inputs: Mortgage Payment Frequency (12 = monthly), Maturity Years (e.g. 2), Initial Principal, Mortgage Rate (e.g. 0.05),
-             CPR (e.g. 0.05), Start Date (e.g. 01-01-2026), Apply CPR (Set at TRUE)
-
-    Outputs: List of Residual Debt,
-             List of Time in Years (hardcoded as steps in 6 months for visualisation),
-             List of Actual Dates (e.g. 01-01-2026, 01-07-20206,...)
-    """
+def simulate_amortization_cpr(payment_freq, maturity_years, N_0, mortgage_rate, annual_cpr, start_date, apply_cpr=True):
     total_periods = int(maturity_years * payment_freq)
+    periodic_cpr = 1.0 - (1.0 - annual_cpr) ** (1.0 / payment_freq)
     
-    # Standard Annuity Formula for Initial Payment (PMT)
-    discount_factor = (1.0 + K_rate) ** (-total_periods)
-    pmt = (K_rate * N_0) / (1.0 - discount_factor)
+    period_rate = mortgage_rate / payment_freq  
+
+    discount_factor = (1.0 + period_rate) ** (-total_periods)  
+    pmt = (period_rate * N_0) / (1.0 - discount_factor)       
 
     n_list = []
     time_list = []
     date_list = []
 
-    # Initial State 
     N_prev = N_0
     n_list.append(N_prev)
     time_list.append(0.0)
@@ -42,35 +31,28 @@ def simulate_amortization_cpr(payment_freq, maturity_years, N_0, K_rate, cpr, st
     current_date = start_date
 
     for i in range(1, total_periods + 1):
-        
-        # 1. Standard Amortization Components
-        interest_payment = K_rate * N_prev
+        interest_payment = period_rate * N_prev 
         principal_payment = pmt - interest_payment
 
-        # 2. Outstanding Balance & Prepayment
         if apply_cpr and i < total_periods:
             standard_balance = N_prev - principal_payment
-            prepayment_amount = cpr * standard_balance
+            prepayment_amount = periodic_cpr * standard_balance
             N_curr = standard_balance - prepayment_amount
         else:
             N_curr = N_prev - principal_payment
 
-        # 3. Recalculate Annuity
         if apply_cpr and i < total_periods:
             remaining_periods = total_periods - i
-            discount_factor = (1.0 + K_rate) ** (-remaining_periods)
-            pmt = (K_rate * N_curr) / (1.0 - discount_factor)
+            discount_factor = (1.0 + period_rate) ** (-remaining_periods)  
+            pmt = (period_rate * N_curr) / (1.0 - discount_factor)        
 
-        # 4. Step Time Forward (Hardcoded to 6 months for semi-annual grid)
-        delta_time = relativedelta(months=6)
+        delta_time = relativedelta(months=int(12 / payment_freq))
         current_date = current_date + delta_time
 
-        # Store Results
-        n_list.append(max(0, N_curr)) # Prevent negative balances
-        time_list.append(i * 0.5)
+        n_list.append(max(0, N_curr))
+        time_list.append(i * (1.0 / payment_freq))
         date_list.append(current_date)
 
-        # Update for next iteration
         N_prev = N_curr
 
     return n_list, time_list, date_list
@@ -79,26 +61,12 @@ def simulate_amortization_cpr(payment_freq, maturity_years, N_0, K_rate, cpr, st
 # 2) Band Creation
 # ============================================================
 
-def build_amortization_bands(maturity_years, CPR, N0, K, ref_date, pay_yy=2, base_pp = 0.01):
-    """
-
-    Inputs: Maturity Years (e.g. 2), CPR (e.g. 0.05), Initial Principal,
-            Mortgage Rate (e.g. 0.05), Start Date (e.g. 01-01-2026), Mortgage Payment Frequency (Set at 6 months),
-            Baseline CPR (Set at 0.01)
-
-    Outputs: List of Actual Dates (e.g. 01-01-2026, 01-07-20206,...)
-             List of Residual Debt under baseline CPR
-             List of Residual Debt under inputted CPR
-             List of Time in Years (hardcoded as steps in 6 months for visualisation),
-             
-    Returns the Baseline expected path and the Stressed tail path.
-    """
-
+def build_amortization_bands(maturity_years, CPR, N0, mortgage_rate, ref_date, pay_yy=2, base_pp=0.01):
     upper_n, time_list, dates_upper = simulate_amortization_cpr(
-        pay_yy, maturity_years, N0, K, base_pp, ref_date, True
+        pay_yy, maturity_years, N0, mortgage_rate, base_pp, ref_date, True
     )
     lower_n, _, dates_lower = simulate_amortization_cpr(
-        pay_yy, maturity_years, N0, K, CPR, ref_date, True
+        pay_yy, maturity_years, N0, mortgage_rate, CPR, ref_date, True
     )
 
     return dates_upper, upper_n, lower_n, time_list
@@ -107,24 +75,44 @@ def build_amortization_bands(maturity_years, CPR, N0, K, ref_date, pay_yy=2, bas
 # 3) Portfolio Builder - Constant Prepayment Hedge
 # ============================================================
 
-def build_constant_prepay_ptf(dates, expected_n, lower_n, K, p_min=0.01):
+def build_constant_prepay_ptf(date, maturity_years, payment_freq, N_0, CPR_exp, mortgage_rate, strike_rate, CPR_min=0.01):
+    """
+    Inputs: 
+    - Ref Date (e.g. 01-01-2026)
+    - Maturity Years (e.g. 10)
+    - Payment Frequency (12 = monthly, 2 = every 6 months)
+    - Initial Principal
+    - CPR (e.g. 0.08)
+    - Mortgage Rate (Used for amortisation)
+    - Strike Rate (Used for derivative pricing)
+    - Baseline CPR (Set at 0.01)
+
+    Output: Pandas Dataframe of Required Constant Prepayment Portfolio
+    """
+
+    lower_n, time_list, date_list = simulate_amortization_cpr(
+        payment_freq, maturity_years, N_0, mortgage_rate, CPR_min, date, apply_cpr=True
+    )
+    expected_n, _, _ = simulate_amortization_cpr(
+        payment_freq, maturity_years, N_0, mortgage_rate, CPR_exp, date, apply_cpr=True
+    )
+
+    p_min = 1.0 - (1.0 - CPR_min) ** (1.0 / payment_freq)  
+
     portfolio = []
 
-    for i in range(1, len(dates)):
-        # Calculate the gaps for the current and previous periods
-        delta_curr = expected_n[i] - lower_n[i]
-        delta_prev = expected_n[i-1] - lower_n[i-1]
+    for i in range(1, len(date_list)):
+        delta_curr = lower_n[i] - expected_n[i]      
+        delta_prev = lower_n[i-1] - expected_n[i-1]  
         
-        # Calculate the incremental notional (omega_i)
-        notional = delta_curr - delta_prev * (1 - p_min)
+        notional = delta_curr - (delta_prev * (1 - p_min)) 
 
-        # Only add to portfolio if bigger than 0.01 = 0.01 % of N_0 
         if notional > 0.01: 
-            tenor_years = (dates[-1] - dates[i]).days / 365.25
+            tenor_years = round((date_list[-1] - date_list[i]).days / 365.25, 2)
             row = {
-                'OPTION_EXPIRY': dates[i],
+                'OPTION_EXPIRY': date_list[i],
                 'SWAP_TENOR': tenor_years,
-                'STRIKE': K,
+                'STRIKE': strike_rate,
                 'NOTIONAL': notional,
                 'TYPE': 'RECEIVER_ATM'
             }
@@ -136,42 +124,63 @@ def build_constant_prepay_ptf(dates, expected_n, lower_n, K, p_min=0.01):
 # 4) Hybrid Portfolio Builder
 # ============================================================
 
-def build_hybrid_ptf(dates, N_min, N_exp, N_max, K, p_min=0.01):
+def build_hybrid_ptf(date, maturity_years, payment_freq, N_0, CPR_exp, CPR_max, mortgage_rate, strike_rate, shock, CPR_min=0.01):
+    """
+    Inputs: 
+    - Ref Date (e.g. 01-01-2026)
+    - Maturity Years (e.g. 10)
+    - Payment Frequency (12 = monthly, 2 = every 6 months)
+    - Initial Principal
+    - Expected CPR (e.g. 0.08)
+    - Maximum CPR (e.g. 0.15)
+    - Mortgage Rate (Used for amortisation)
+    - Strike Rate (Used for derivative pricing)
+    - Shock Rate for OTM Swaptions (Basel III recommends up to 0.02)
+    - Baseline CPR (Set at 0.01)
+
+    Output: Pandas Dataframe of Required Hybrid Portfolio
+    """
+    lower_n, time_list, date_list = simulate_amortization_cpr(
+        payment_freq, maturity_years, N_0, mortgage_rate, CPR_min, date, apply_cpr=True
+    )
+    expected_n, _, _ = simulate_amortization_cpr(
+        payment_freq, maturity_years, N_0, mortgage_rate, CPR_exp, date, apply_cpr=True
+    )
+    max_n, _, _ = simulate_amortization_cpr(
+        payment_freq, maturity_years, N_0, mortgage_rate, CPR_max, date, apply_cpr=True
+    )
+
+    p_min = 1.0 - (1.0 - CPR_min) ** (1.0 / payment_freq) 
+
     portfolio = []
     
-    # from basel 3 (200 bps shock)
-    K_OTM = K - 0.02 
+    K_OTM = strike_rate - shock 
 
-    for i in range(1, len(dates)):
+    for i in range(1, len(date_list)):
         
-        delta_N_baseline_curr = N_min[i] - N_exp[i]
-        delta_N_baseline_prev = N_min[i-1] - N_exp[i-1]
+        delta_baseline_curr = lower_n[i] - expected_n[i]    
+        delta_baseline_prev = lower_n[i-1] - expected_n[i-1] 
         
-        delta_N_tail_curr = N_exp[i] - N_max[i]
-        delta_N_tail_prev = N_exp[i-1] - N_max[i-1]
+        delta_tail_curr = expected_n[i] - max_n[i]
+        delta_tail_prev = expected_n[i-1] - max_n[i-1]
 
-        # incremental strips (omega)
-        omega_ATM = delta_N_baseline_curr - delta_N_baseline_prev * (1 - p_min)
-        omega_OTM = delta_N_tail_curr - delta_N_tail_prev * (1 - p_min)
+        omega_ATM = delta_baseline_curr - (delta_baseline_prev * (1 - p_min)) 
+        omega_OTM = delta_tail_curr - (delta_tail_prev * (1 - p_min))         
 
-        tenor_years = (dates[-1] - dates[i]).days / 365.25
+        tenor_years = round((date_list[-1] - date_list[i]).days / 365.25, 2)
 
-        #Again only consider actual notionals 
-
-        # atm layer
         if omega_ATM > 0.01:
             portfolio.append({
-                'OPTION_EXPIRY': dates[i],
+                'OPTION_EXPIRY': date_list[i],
                 'SWAP_TENOR': tenor_years,
-                'STRIKE': K,
+                'STRIKE': strike_rate,
                 'NOTIONAL': omega_ATM,
                 'TYPE': 'RECEIVER_ATM'
             })
             
-        # otm layer
         if omega_OTM > 0.01:
             portfolio.append({
-                'OPTION_EXPIRY': dates[i],
+                'OPTION_EXPIRY': date_list[i],
                 'SWAP_TENOR': tenor_years,
                 'STRIKE': K_OTM,
                 'NOTIONAL': omega_OTM,
